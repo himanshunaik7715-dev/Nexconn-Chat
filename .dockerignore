@@ -11,3 +11,15 @@ coverage
 *.sqlite-wal
 *.db
 *.log
+.env
+.env.*
+!.env.example
+node_modules
+dist
+data
+coverage
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log

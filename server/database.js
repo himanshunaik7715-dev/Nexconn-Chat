@@ -1,49 +1,112 @@
-import Database from 'better-sqlite3';
-import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import pg from 'pg';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-export function openDatabase(databasePath = './data/nexconn-chat.sqlite') {
-  const resolvedPath = databasePath === ':memory:' ? databasePath : resolve(databasePath);
-  if (resolvedPath !== ':memory:') mkdirSync(dirname(resolvedPath), { recursive: true });
+const { Pool } = pg;
+const migrationDirectory = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
+const migrations = [{ version: 1, file: '001-initial-schema.sql' }];
 
-  const db = new Database(resolvedPath);
-  db.pragma('foreign_keys = ON');
-  db.pragma('busy_timeout = 5000');
-  if (resolvedPath !== ':memory:') db.pragma('journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-      email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-      display_name TEXT NOT NULL DEFAULT '',
-      avatar_url TEXT NOT NULL DEFAULT '',
-      password_hash TEXT NOT NULL,
-      nexconn_user_id TEXT NOT NULL UNIQUE,
-      created_at TEXT NOT NULL
-    );
+export class DatabaseUnavailableError extends Error {
+  constructor(cause) {
+    super('The account database is temporarily unavailable.', { cause });
+    this.name = 'DatabaseUnavailableError';
+    this.code = 'DATABASE_UNAVAILABLE';
+  }
+}
 
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_at INTEGER NOT NULL,
-      revoked_at INTEGER,
-      created_at INTEGER NOT NULL
-    );
+export function isDatabaseUnavailable(error) {
+  return error instanceof DatabaseUnavailableError || [
+    '08000', '08001', '08003', '08004', '08006', '08007', '08P01', '53300', '57P01', '57P02', '57P03',
+    'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND',
+  ].includes(error?.code);
+}
 
-    CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id);
-    CREATE INDEX IF NOT EXISTS users_nexconn_user_id_idx ON users(nexconn_user_id);
+async function runMigrations(pool) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await client.query(`CREATE TABLE IF NOT EXISTS schema_migration_lock (
+      id INTEGER PRIMARY KEY CHECK (id = 1)
+    )`);
+    await client.query('INSERT INTO schema_migration_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING');
+    await client.query('SELECT id FROM schema_migration_lock WHERE id = 1 FOR UPDATE');
 
-    CREATE TABLE IF NOT EXISTS favorites (
-      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      channel_type TEXT NOT NULL CHECK (channel_type IN ('direct', 'group')),
-      channel_id TEXT NOT NULL CHECK (length(channel_id) BETWEEN 1 AND 128),
-      created_at TEXT NOT NULL,
-      PRIMARY KEY (user_id, channel_type, channel_id)
-    );
-  `);
-  const userColumns = new Set(db.prepare('PRAGMA table_info(users)').all().map((column) => column.name));
-  if (!userColumns.has('display_name')) db.exec("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''");
-  if (!userColumns.has('avatar_url')) db.exec("ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''");
-  db.exec("UPDATE users SET display_name = username WHERE display_name = ''");
-  return db;
+    for (const migration of migrations) {
+      const applied = await client.query('SELECT 1 FROM schema_migrations WHERE version = $1', [migration.version]);
+      if (applied.rowCount) continue;
+      const sql = await readFile(join(migrationDirectory, migration.file), 'utf8');
+      await client.query(sql);
+      await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [migration.version]);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/** Create the asynchronous PostgreSQL store and apply versioned schema migrations. */
+export async function openDatabase(databaseUrl, { PoolFactory, initialize = true } = {}) {
+  if (typeof databaseUrl !== 'string' || !databaseUrl.trim()) {
+    throw new Error('DATABASE_URL must be configured for the PostgreSQL database.');
+  }
+  let parsed;
+  try { parsed = new URL(databaseUrl); }
+  catch { throw new Error('DATABASE_URL must be a valid PostgreSQL connection URL.'); }
+  if (!['postgres:', 'postgresql:'].includes(parsed.protocol) || !parsed.hostname || !parsed.pathname || parsed.pathname === '/') {
+    throw new Error('DATABASE_URL must identify a PostgreSQL database.');
+  }
+
+  const poolOptions = {
+    connectionString: databaseUrl,
+    max: 5,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+    keepAlive: true,
+  };
+  const pool = PoolFactory ? PoolFactory(poolOptions) : new Pool(poolOptions);
+  pool.on?.('error', () => {
+    // Do not log driver errors: they may contain host or connection details.
+  });
+
+  try {
+    await pool.query('SELECT 1');
+    if (initialize) await runMigrations(pool);
+  } catch (error) {
+    await pool.end().catch(() => {});
+    if (isDatabaseUnavailable(error)) throw new DatabaseUnavailableError(error);
+    throw error;
+  }
+
+  return {
+    query: (text, values = []) => pool.query(text, values),
+    transaction: async (callback) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await callback({ query: (text, values = []) => client.query(text, values) });
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    close: () => pool.end(),
+    pool,
+  };
+}
+
+/** Apply pending migrations to a pool owned by an isolated test or import process. */
+export async function initializeDatabase(pool) {
+  await runMigrations(pool);
 }

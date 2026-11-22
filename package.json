@@ -16,7 +16,9 @@
     "preview": "vite preview",
     "test": "node --test",
     "audit:secrets": "node scripts/audit-secrets.js",
-    "db:prepare-migration": "node scripts/prepare-db-migration.js"
+    "db:prepare-migration": "node scripts/prepare-db-migration.js",
+    "db:import-migration": "node scripts/import-sqlite-to-postgres.js",
+    "db:import-sqlite-to-postgres": "node scripts/import-sqlite-to-postgres.js"
   },
   "dependencies": {
     "@nexconn/chat": "26.2.0",
@@ -32,11 +34,14 @@
     "jsonwebtoken": "^9.0.2",
     "lit": "^3.3.3",
     "lucide-react": "^0.456.0",
+    "pg": "^8.23.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.17",
+    "@electric-sql/pglite-socket": "^0.2.20",
     "@types/node": "~18.14.6",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",

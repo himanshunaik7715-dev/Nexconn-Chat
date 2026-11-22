@@ -3,15 +3,15 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import jwt from 'jsonwebtoken';
-import { openDatabase } from './database.js';
 import { createApp } from './app.js';
 import { createNexconnService } from './nexconn.js';
+import { createIsolatedDatabase } from '../test/postgres-test-database.js';
 
 const config = { nodeEnv: 'test', jwtSecret: 'test-only-secret-with-at-least-32-characters', appOrigin: 'http://localhost:5173', cookieSecure: false, nexconnAppKey: 'app-key-test', nexconnAppSecret: 'nexconn-secret-never-in-response', nexconnAreaCode: 'SG' };
 const mockNexconn = { isConfigured: () => true, issueToken: async ({ userId }) => ({ userId, accessToken: `issued-${userId}` }) };
 
 test('account sessions protect APIs and support two-user direct discovery', async (t) => {
-  const db = openDatabase(':memory:');
+  const { database: db } = await createIsolatedDatabase();
   const server = createServer(createApp({ db, config, nexconn: mockNexconn, staticFiles: false }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -19,7 +19,11 @@ test('account sessions protect APIs and support two-user direct discovery', asyn
     ...options,
     headers: { Origin: config.appOrigin, ...(options.body ? { 'content-type': 'application/json' } : {}), ...(cookie ? { cookie } : {}), ...options.headers },
   });
-  t.after(async () => { await new Promise((resolve) => server.close(resolve)); db.close(); });
+  t.after(async () => { await new Promise((resolve) => server.close(resolve)); await db.close(); });
+
+  const health = await request('/api/health');
+  assert.equal(health.status, 200);
+  assert.deepEqual(await health.json(), { ok: true });
 
   assert.equal((await request('/api/users?search=alice')).status, 401);
   assert.equal((await request('/api/users?search=alice', { cookie: 'nas_session=invalid-token' })).status, 401);
@@ -74,7 +78,7 @@ test('account sessions protect APIs and support two-user direct discovery', asyn
   const refreshed = await request('/api/auth/session', { cookie: alice.cookie });
   assert.equal(refreshed.status, 200);
   assert.equal((await refreshed.json()).user.username, 'alice');
-  const passwordHash = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(alice.data.user.id).password_hash;
+  const passwordHash = (await db.query('SELECT password_hash FROM users WHERE id = $1', [alice.data.user.id])).rows[0].password_hash;
   assert.notEqual(passwordHash, 'correct horse battery');
   assert.match(passwordHash, /^\$2[aby]\$/);
   const duplicate = await request('/api/auth/register', { method: 'POST', body: JSON.stringify({ username: 'Alice', email: 'other@example.test', password: 'correct horse battery' }) });
@@ -124,7 +128,7 @@ test('account sessions protect APIs and support two-user direct discovery', asyn
   const displayNameSearch = await request('/api/users?search=Bob%20Example', { cookie: alice.cookie });
   assert.equal(displayNameSearch.status, 200);
   assert.equal((await displayNameSearch.json()).users[0].username, 'bob_user');
-  assert.equal(db.prepare('SELECT display_name FROM users WHERE id = ?').get(alice.data.user.id).display_name, 'alice');
+  assert.equal((await db.query('SELECT display_name FROM users WHERE id = $1', [alice.data.user.id])).rows[0].display_name, 'alice');
   const updatedProfiles = await request('/api/users/profiles', { method: 'POST', cookie: alice.cookie, body: JSON.stringify({ userIds: [bob.data.nexconn.userId] }) });
   assert.equal((await updatedProfiles.json()).profiles[0].name, 'Bob Example');
   const unsafeAvatar = await request('/api/account/profile', { method: 'PUT', cookie: bob.cookie, body: JSON.stringify({ displayName: 'Bob Example', avatarUrl: 'http://insecure.example.test/avatar.png' }) });
@@ -136,7 +140,7 @@ test('account sessions protect APIs and support two-user direct discovery', asyn
   assert.equal((await request('/api/users?search=bob', { cookie: alice.cookie })).status, 401);
 
   const expiredAccount = await register('expired_user', 'expired@example.test');
-  db.prepare('UPDATE sessions SET expires_at = 0 WHERE user_id = ?').run(expiredAccount.data.user.id);
+  await db.query('UPDATE sessions SET expires_at = 0 WHERE user_id = $1', [expiredAccount.data.user.id]);
   assert.equal((await request('/api/users?search=bob', { cookie: expiredAccount.cookie })).status, 401);
 });
 

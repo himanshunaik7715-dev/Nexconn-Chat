@@ -14,8 +14,8 @@ Audit date: 2026-11-22. Findings are based on the current source, installed Nexc
 | Message history, timestamp and receipts | Implemented from SDK fields; patch-tested | SDK sentTime is rendered; SENT and read-receipt-backed READ are used. No separate delivered state exists. Real message delivery was previously reported by the owner but was not re-proven in this audit. |
 | Search | Implemented with scope limitation | User/channel search and loaded SDK message search exist; no unbounded Nexconn history index. |
 | Attachments | Integrated; end-to-end unverified | Uses SDK upload/download flow and `Message.downloadMedia()`, image/PDF preview behavior, inline PDF disposition; real sender/receiver transfer, expiry and browser preview require Nexconn credentials and two sessions. |
-| Database | Implemented; schema reviewed | SQLite users/sessions/favorites; foreign keys, indexes, WAL, idempotent DDL. No versioned migrations; one service instance and durable disk required. |
-| Existing account-data migration | Prepared; fixture-tested | `npm run db:prepare-migration` uses SQLite online backup, keeps accounts/favorites, clears prior sessions, checks integrity and reports counts only. Transfer output securely after creating the live persistent volume. |
+| Database | PostgreSQL runtime implemented; local isolated tests | PostgreSQL users/sessions/favorites; case-insensitive unique indexes; foreign keys; versioned startup migrations; bounded `pg.Pool`. Production Neon connection and deployment are not verified. |
+| Existing account-data migration | Importer implemented; isolated fixture-tested | `scripts/import-sqlite-to-postgres.js` snapshots SQLite online and imports users/favorites transactionally, excludes sessions, checks all field values and constraints, and refuses non-empty targets. The authoritative production SQLite source is not confirmed. |
 | Responsive/accessibility UI | Source and regression tests pass; browser QA pending | Mobile layout and SDK themes are covered by source tests; device/browser screenshots and interaction audit were not run in this turn. |
 | Security headers and logging | Implemented; static checks pass | Helmet/CSP, request-size cap, safe API diagnostics, SDK error-only log level; vendor patch removes raw message/debug logs. Inline styles remain permitted for Lit SDK rendering. |
 | Environment and Git secret checks | Passed | `.env` ignored and untracked; template placeholders only; client-bundle secret scan passed without printing values. No commit history exists to inspect. |
@@ -26,26 +26,29 @@ Audit date: 2026-11-22. Findings are based on the current source, installed Nexc
 ## Findings fixed in this pass
 
 1. The SDK postinstall patch's empty-replacement idempotency check could skip removal of a debug statement during clean installs. It now distinguishes “replacement already applied” from “empty replacement source still exists,” and the installed SDK bundle test checks for raw-message and picker/channel debug strings.
-2. Production server configuration could silently fall back to local development defaults or defer Nexconn configuration failure until account registration. Startup now requires the correct production origins/credentials, supported region, and an absolute persistent SQLite path. It validates `PORT` and `TRUST_PROXY_HOPS`; Express only trusts the configured proxy count.
+2. Production server configuration now requires the exact HTTPS app origin, server-side PostgreSQL `DATABASE_URL` with TLS, Nexconn credentials, and a supported region. It validates `PORT` and `TRUST_PROXY_HOPS`; Express only trusts the configured proxy count.
 3. The root README lacked the requested architecture, auth/message flow, data model, route inventory, file lifecycle, verification limits and production deployment steps. It now documents those based on the current code and labels unverified deployment/service behaviors.
 
 ## Cleanup assessment
 
-No project files, folders, or direct dependencies were deleted. In the reviewed small repo, UI assets are loaded dynamically or by SDK configuration; SDK patching, license notices, tests, Docker configuration, environment templates and SQLite storage are required. No deletion was justified by actual references or build behavior. Build outputs, dependency directories, local data, logs and `.env` remain excluded from Git.
+The Render disk-mount guard was removed after PostgreSQL runtime support was added. `better-sqlite3` remains for the one-time importer; application requests use PostgreSQL. Build outputs, dependency directories, local data, logs and `.env` remain excluded from Git.
 
 ## Verification record
 
-- `npm test`: 38 passed, 0 failed.
+Latest local verification for the PostgreSQL migration work:
+
+- `npm test`: 49 passed, 0 failed, 0 skipped.
 - `npx tsc --noEmit`: passed.
-- `npm run build`: passed; warning remains for the SDK Engine chunk (860 kB minified / roughly 179 kB gzip).
-- `npm audit`: zero vulnerabilities.
-- `npm audit --omit=dev --audit-level=moderate`: zero vulnerabilities.
-- `npm run audit:secrets`: passed; the scanner checked local secret-like values without printing them and confirmed `.env` is ignored/untracked.
-- `git diff --check`: passed for available tracked diff; project files are currently untracked because the repository has no commits.
-- Clean `npm ci`: not fully verified because the running local Node/Vite processes held native Windows dependency files open (`EPERM`). `npm install --ignore-scripts` restored dependencies, `npm rebuild better-sqlite3` restored the native binding, then the postinstall patch, test suite, typecheck and build passed. Repeat `npm ci` after stopping local dev processes.
-- The database migration utility was tested against a temporary fixture containing an account, session and favorite; it preserved the account/favorite, removed the session only from the export, and passed SQLite integrity checking. A private local migration export was generated from the active database and passed SQLite integrity checking; it is ignored by Git and has not been uploaded.
-- Live Nexconn message/file transfer, current Console token expiry, browser/device screenshot QA, and a public deployment were not verified.
+- `npm run build`: passed; Vite warns that the Nexconn Engine chunk is large (about 860 kB minified / 179 kB gzip).
+- `npm run audit:secrets`: passed; local secret-like values are checked without printing them, `.env` is ignored, and the frontend bundle did not receive server credentials.
+- `git diff --check`: passed. Git emitted only its normal LF-to-CRLF working-copy notices.
+- PostgreSQL behavior tests use an isolated local PGlite/Postgres-wire server; no Neon or Render database was contacted.
+- Docker build was attempted but could not start because the local Docker Desktop Linux engine is unavailable. This is not a build pass.
+- No production migration, hosted environment update, deployment, or live Nexconn delivery test was performed.
+- Earlier SQLite exporter fixture checks are not evidence that a local SQLite file is the authoritative production database. The source database for cutover remains unconfirmed.
 
-## GitHub/deployment blocker
+`npm ci` was not re-run during this migration pass. A previous Windows attempt encountered `EPERM` while local Node/Vite processes held native dependency files open; perform a clean install after stopping those processes if needed.
 
-Current Git state is branch `master`, zero commits, zero remotes, and all source files untracked. The exact target GitHub repository and initial branch are unknown. The attached master instructions explicitly require stopping when the remote is missing, so no initial commit or push was created. Provide the intended GitHub repository URL (and confirm `master` or `main`) to continue. A hosting account, private production secrets, persistent disk, and optional custom domain must also be configured before deployment.
+## GitHub/deployment state
+
+The worktree is on branch `main`, has an existing commit and the configured origin `https://github.com/himanshunaik7715-dev/Nexconn-Chat.git`. This migration work remains uncommitted and unpushed. No deployment was performed. The hosted service configuration and authoritative production SQLite source must be verified before cutover.

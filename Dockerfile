@@ -10,12 +10,10 @@ FROM node:22-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3001
-ENV DATABASE_PATH=/data/nexconn-chat.sqlite
 COPY package.json package-lock.json .npmrc ./
 COPY scripts ./scripts
 RUN npm ci --omit=dev \
-  && mkdir -p /data \
-  && chown -R node:node /app /data
+  && chown -R node:node /app
 COPY server ./server
 COPY --from=build /app/dist ./dist
 USER node

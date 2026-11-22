@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import { existsSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { createApp } from './app.js';
 import { openDatabase } from './database.js';
@@ -11,7 +9,7 @@ const jwtSecret = process.env.JWT_SECRET || (nodeEnv === 'production' ? '' : ran
 if (jwtSecret.length < 32) throw new Error('JWT_SECRET must contain at least 32 characters.');
 const production = nodeEnv === 'production';
 const appOrigin = process.env.APP_ORIGIN || (production ? '' : 'http://localhost:5173');
-const databasePath = process.env.DATABASE_PATH || (production ? '' : './data/nexconn-chat.sqlite');
+const databaseUrl = process.env.DATABASE_URL || '';
 const nexconnAppKey = process.env.NEXCONN_APP_KEY || '';
 const nexconnAppSecret = process.env.NEXCONN_APP_SECRET || '';
 const nexconnApiBaseUrl = process.env.NEXCONN_API_BASE_URL || '';
@@ -42,16 +40,16 @@ if (production) {
   if (!['BJ', 'SG', 'NA', 'SA', 'OM'].includes(nexconnAreaCode)) {
     throw new Error('Production NEXCONN_AREA_CODE must be a supported SDK region code.');
   }
-  if (!isAbsolute(databasePath) || databasePath === ':memory:') {
-    throw new Error('Production DATABASE_PATH must be an absolute path on persistent storage.');
+  if (!databaseUrl) throw new Error('Production requires a server-side PostgreSQL DATABASE_URL.');
+  let databaseOrigin;
+  try { databaseOrigin = new URL(databaseUrl); }
+  catch { throw new Error('Production DATABASE_URL must be a valid PostgreSQL connection URL.'); }
+  if (!['postgres:', 'postgresql:'].includes(databaseOrigin.protocol)
+    || !['require', 'verify-ca', 'verify-full'].includes(databaseOrigin.searchParams.get('sslmode'))) {
+    throw new Error('Production DATABASE_URL must be PostgreSQL and require TLS (sslmode=require).');
   }
   if (!nexconnAppKey || !nexconnAppSecret) throw new Error('Production requires Nexconn server credentials.');
 }
-const legacyDatabasePath = './data/nas-on.sqlite';
-const nexconnDatabasePath = './data/nexconn-chat.sqlite';
-const defaultDatabasePath = existsSync(resolve(legacyDatabasePath)) && !existsSync(resolve(nexconnDatabasePath))
-  ? legacyDatabasePath
-  : nexconnDatabasePath;
 
 const config = {
   nodeEnv,
@@ -60,7 +58,7 @@ const config = {
   cookieSecure: production,
   port,
   trustProxyHops,
-  databasePath: databasePath || defaultDatabasePath,
+  databaseUrl,
   nexconnAppKey,
   nexconnAppSecret,
   nexconnApiBaseUrl,
@@ -72,16 +70,22 @@ const config = {
   } : undefined,
 };
 
-const db = openDatabase(config.databasePath);
+let db;
+try {
+  db = await openDatabase(config.databaseUrl);
+} catch {
+  process.stderr.write('Could not initialize the PostgreSQL database. Check the server-side DATABASE_URL and database availability.\n');
+  process.exit(1);
+}
 const app = createApp({ db, config, nexconn: createNexconnService(config) });
 const server = app.listen(config.port, '0.0.0.0', () => {
   process.stdout.write(`Nexconn server listening on port ${config.port}\n`);
 });
 
 function shutdown() {
-  server.close(() => {
-    db.close();
-    process.exit(0);
+  server.close(async () => {
+    try { await db.close(); }
+    finally { process.exit(0); }
   });
 }
 

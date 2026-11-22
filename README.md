@@ -9,17 +9,17 @@ Nexconn Chat is a responsive web application for account-based direct messaging,
 | App accounts, password hashing, sessions, logout | Implemented; API tests included |
 | Direct conversations and real-time message transport | Nexconn SDK integration implemented; live account verification required |
 | Conversation list search, loaded-message search, All/Unread/Favorites filters | Implemented; message search is limited to messages loaded by the SDK |
-| Favorites | Persisted per app account in SQLite; direct and existing group conversations |
+| Favorites | Persisted per app account in PostgreSQL; direct and existing group conversations |
 | Attachments, voice messages, image/PDF previews | Nexconn SDK flow integrated; end-to-end operation requires live Nexconn accounts |
 | Responsive UI | Desktop and mobile rules are implemented; recheck target devices in a browser before release |
 | Calls and group creation | Removed from this product scope |
-| Production hosting / public URL | Not deployed from this workspace |
+| Production hosting / public URL | URLs are live; the changes in this workspace are not deployed yet |
 
 ## Technology and architecture
 
 - TypeScript, React 18, Vite 6
 - Node.js 20+, Express 5, Helmet, `express-rate-limit`
-- SQLite through `better-sqlite3`; bcryptjs password hashes; signed JWT in an HttpOnly cookie
+- PostgreSQL through `pg`; SQLite retained only for the migration importer; bcryptjs hashes and signed JWT in an HttpOnly cookie
 - Nexconn Chat, Chat UI, and Engine packages pinned to `26.2.0`
 - npm, Docker, Node's built-in test runner
 
@@ -29,16 +29,15 @@ The browser uses a same-origin Express API. The server owns application authenti
 
 ```mermaid
 flowchart LR
-  Browser[Browser: React and Nexconn Web SDK] -->|same-origin HTTPS| App[Node and Express: UI assets and API]
+  Browser[Browser: React and Nexconn Web SDK] -->|same-origin HTTPS| Vercel[Vercel static frontend]
+  Vercel -->|same-origin /api proxy| App[Render Node and Express API]
   App --> Auth[App authentication: bcrypt, JWT, session checks]
-  Auth --> DB[(SQLite: users, sessions, favorites)]
+  Auth --> DB[(Neon PostgreSQL: users, sessions, favorites)]
   App -->|signed token issue request; App Secret stays here| NexconnAPI[Nexconn Server API]
   NexconnAPI -->|per-user SDK token| App
   App -->|app key and user token over TLS| Browser
   Browser <-->|SDK connection and real-time messages| Nexconn[Managed Nexconn service]
   Browser -->|attachment transfer using SDK| NexconnFiles[Nexconn-managed file service]
-  Host[Docker host, HTTPS and persistent disk] --> App
-  Host --> DB
 ```
 
 ### B. Authentication and SDK connection lifecycle
@@ -48,7 +47,7 @@ sequenceDiagram
   actor User
   participant UI as React browser
   participant API as Express API
-  participant DB as SQLite
+  participant DB as PostgreSQL
   participant NX as Nexconn Server API
   participant SDK as Nexconn Web SDK
   User->>UI: Register or sign in
@@ -85,7 +84,7 @@ sequenceDiagram
   UI1-->>Sender: Render SDK SENT / READ state and original timestamp
 ```
 
-The application does not mirror message bodies, receipts, attachment bytes, or chat history into SQLite. There is no distinct delivered tick in the SDK state used by this app.
+The application does not mirror message bodies, receipts, attachment bytes, or chat history into PostgreSQL. There is no distinct delivered tick in the SDK state used by this app.
 
 ### D. Deployment architecture
 
@@ -97,12 +96,13 @@ flowchart LR
   Build --> Runtime[Node and Express on host PORT]
   Runtime -->|HTTPS app and /api| Users[Browsers]
   Runtime -->|private env secrets| Config[Host environment configuration]
-  Runtime -->|absolute mount path| Disk[(Persistent SQLite volume)]
+  Runtime -->|server-only DATABASE_URL| DB[(Neon PostgreSQL)]
+  Vercel[Vercel static frontend] -->|/api/* external rewrite| Runtime
   Users <-->|SDK HTTPS and WebSocket| NX[Managed Nexconn services]
   Users <-->|upload/download via SDK| Files[Nexconn-managed files]
 ```
 
-The Docker host and disk are deployment infrastructure, not provisioned by this repository. This SQLite architecture is for one app instance. Multiple app replicas need a shared transactional database (for example managed PostgreSQL) and a reviewed schema migration before scaling.
+The Render API uses Neon PostgreSQL for durable state; it does not store production data on Render's ephemeral filesystem and requires no Render disk. Vercel keeps browser API calls same-origin and proxies `/api/*` to Render.
 
 ## Repository layout
 
@@ -113,10 +113,12 @@ The Docker host and disk are deployment infrastructure, not provisioned by this 
 ├── scripts/
 │   ├── audit-secrets.js        Secret/build audit without printing values
 │   ├── patch-nexconn-chatui.js Guarded postinstall patches for SDK 26.2.0
-│   └── prepare-db-migration.js Consistent account-data export for deployment
+│   ├── prepare-db-migration.js Consistent SQLite snapshot preparation
+│   └── import-sqlite-to-postgres.js Verified transactional SQLite importer
 ├── server/
 │   ├── app.js                  Express security middleware and API routes
-│   ├── database.js             SQLite schema creation and compatibility updates
+│   ├── database.js             PostgreSQL pool, transactions, and versioned migrations
+│   └── migrations/             Versioned PostgreSQL schema
 │   ├── nexconn.js              Server-side signed Nexconn token issuance
 │   └── index.js                Environment validation and server startup
 ├── src/
@@ -125,17 +127,19 @@ The Docker host and disk are deployment infrastructure, not provisioned by this 
 │   └── styles/                 Responsive application styles
 ├── test/                       API, SDK patch, date and lifecycle tests
 ├── Dockerfile                  Build and non-root runtime image
+├── vercel.json                 Same-origin API proxy to the Render service
 ├── PROJECT_AUDIT.md            Audit checklist and verification status
 ├── SECURITY_AUDIT.md           Credential findings and rotation guidance
 └── vite.config.ts              Dev server, same-origin API proxy, build chunks
 ```
 
-`data/`, `.env`, `node_modules/`, `dist/`, and SQLite files are excluded from Git and the Docker build context. SDK patching is reproducible through the npm `postinstall` script; do not edit the installed vendor bundle as the only copy of a fix.
+`data/`, `.env`, `node_modules/`, `dist/`, and SQLite files are excluded from Git and the Docker build context. `DATABASE_URL` is server-only and is never provided to Vite. SDK patching is reproducible through the npm `postinstall` script; do not edit the installed vendor bundle as the only copy of a fix.
 
 ## Requirements and setup
 
 - Node.js 20 or newer (Docker uses Node 22)
 - npm
+- A Neon PostgreSQL development database (use a separate branch/database from production)
 - A Nexconn application with its server-side App Key and App Secret, and the matching regional API base URL and area code
 
 Install and prepare local configuration:
@@ -145,7 +149,7 @@ npm ci
 Copy-Item .env.example .env
 ```
 
-Set the local variables in `.env`. Generate a development JWT secret with:
+Set `DATABASE_URL` to the **pooled** connection string for your development Neon branch. Do not paste a production URL into a shared shell or use a `VITE_` prefix. Generate a development JWT secret with:
 
 ```powershell
 node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"
@@ -161,14 +165,14 @@ Never use a `VITE_` prefix for credentials. The `.env.example` values are placeh
 | `PORT` | Host-provided | Express listen port. Defaults to `3001` locally; Docker binds `3001`, and a host may inject its own port. |
 | `APP_ORIGIN` | Yes | Exact browser origin, with no path. Local Vite: `http://localhost:5173`; production must be the public HTTPS origin. |
 | `JWT_SECRET` | Yes | Random application-session signing secret, minimum 32 characters. Keep stable across restarts. |
-| `DATABASE_PATH` | Yes | SQLite database file. Local default is `./data/nexconn-chat.sqlite`; production must be an absolute path on persistent storage. |
+| `DATABASE_URL` | Yes | Server-side PostgreSQL pooled connection string. Use the Neon connection details with pooling enabled and SSL required. Never expose it to Vite or the browser. |
 | `TRUST_PROXY_HOPS` | Proxy-dependent | `0` by default. Set to the exact trusted proxy hop count only when the host topology is known (often `1` behind a single managed proxy); this controls client IP handling for rate limits. |
 | `NEXCONN_APP_KEY` | Yes | Nexconn app identifier used by the server request and SDK initialization. |
 | `NEXCONN_APP_SECRET` | Yes | Privileged signing secret; server only. Never expose it to the client or logs. |
 | `NEXCONN_API_BASE_URL` | Yes | HTTPS Nexconn regional API origin, e.g. the Singapore origin shown in `.env.example`. |
 | `NEXCONN_AREA_CODE` | Yes | Matching SDK region code; example is `SG`. |
 
-The app intentionally has no third-party object-storage variables or app-level upload endpoint; the Web SDK transfers attachments through Nexconn's media flow.
+The app intentionally has no third-party object-storage variables or app-level upload endpoint; the Web SDK transfers attachments through Nexconn's media flow. The Vercel frontend uses same-origin `/api/*` requests, which `vercel.json` rewrites to Render. No `VITE_API_BASE_URL` is needed.
 
 ## Run, test and build
 
@@ -180,11 +184,12 @@ npm run build           # Production frontend bundle in dist/
 npm audit              # Full dependency advisory report
 npm audit --omit=dev --audit-level=moderate
 npm run audit:secrets   # Check configured secret-like values against client output
-npm run db:prepare-migration # Export local accounts/favorites for a live migration
+npm run db:prepare-migration -- --source <verified-copy.sqlite> --snapshot <private-snapshot.sqlite>
+npm run db:import-sqlite-to-postgres -- --source <verified-snapshot.sqlite> --target-env DATABASE_URL
 npm start               # Start the Express server
 ```
 
-There is no lint or formatter script configured. Do not treat that as a passing lint check. Production startup fails fast unless `JWT_SECRET`, an exact HTTPS `APP_ORIGIN`, HTTPS Nexconn API URL and credentials, and an absolute `DATABASE_PATH` are provided. Keep the SQLite path on a durable volume. `npm start` serves the API and built frontend on one origin.
+Tests run against isolated PGlite PostgreSQL instances and do not read `.env` or connect to Neon. There is no lint or formatter script configured. Production startup fails fast unless `DATABASE_URL`, `JWT_SECRET`, an exact HTTPS `APP_ORIGIN`, HTTPS Nexconn API URL, and Nexconn server credentials are provided. `npm start` serves the API and built frontend on one origin.
 
 ## Authentication, authorization and API
 
@@ -210,25 +215,31 @@ Nexconn App Secret signing and upstream token validation stay server-side. The S
 
 ## Database and schema lifecycle
 
-SQLite tables are initialized at server startup in `server/database.js`:
+`server/database.js` connects to PostgreSQL through a bounded `pg.Pool` using server-only `DATABASE_URL`. It applies versioned SQL files from `server/migrations/` in a transaction and serializes concurrent startup migrations with a database lock row.
 
-- `users`: app ID, unique case-insensitive username and email, display name/avatar, bcrypt hash, Nexconn user ID, created timestamp.
-- `sessions`: random session ID, owner user ID, expiration, revoke timestamp, creation timestamp. Foreign key cascades on account removal.
-- `favorites`: owner user ID, `direct` or `group` channel type, channel ID and creation time. Composite primary key prevents duplicates; foreign key cascades with the owner.
+- `users`: text ID, case-insensitive unique username/email indexes, display name/avatar defaults, bcrypt hash, unique Nexconn user ID, and original ISO timestamp text.
+- `sessions`: text ID, user foreign key with cascade delete, and epoch-millisecond expiry/revocation/creation values stored as `BIGINT`.
+- `favorites`: user foreign key with cascade delete, channel-type and channel-length checks, original timestamp text, and composite primary key `(user_id, channel_type, channel_id)`.
 
-Indexes support session and Nexconn user ID lookups. Schema creation and the existing display/avatar compatibility update are idempotent, but this project does not have a versioned migration framework. Back up the database before releases that change schema. The SQLite file uses WAL and a 5-second busy timeout. Run one app instance against a local persistent disk; use managed shared SQL and a formal migration plan before horizontal scaling.
+Message history, read receipts, and attachment bytes remain Nexconn-managed; this database has no app-side copies. Existing SQLite files are imported only by `scripts/import-sqlite-to-postgres.js`. The importer makes a consistent online snapshot, never writes to the source, imports users and favorites in one transaction, excludes sessions, refuses a non-empty destination, checks row values/constraints/foreign keys, and rolls back on any conflict. It never guesses which SQLite file is authoritative.
 
-### Preserve existing local accounts when going live
+### Prepare and import an authoritative SQLite snapshot
 
-The local SQLite database is ignored by Git and currently resides at `data/nas-on.sqlite`. To prepare a consistent export from the path configured in `.env`, run:
+First verify in the Render Dashboard/Shell which mounted SQLite database the currently running service uses. Create a protected backup from that exact source using SQLite's online backup API, then verify the backup path, integrity check, foreign keys, and expected account/favorite counts. Do not use a local workspace SQLite file unless it has been proven to be the same current source. Keep the original and backup unchanged.
+
+To create a migration copy from a verified SQLite file:
 
 ```powershell
-npm run db:prepare-migration
+npm run db:prepare-migration -- --source <verified-production-copy.sqlite> --snapshot <private-snapshot.sqlite>
 ```
 
-This writes `data/nexconn-live-migration.sqlite`, reports only row counts and integrity status, preserves account/profile records and favorites, and clears application sessions in the copy. Existing users can sign in with their current username/email and password; they must sign in again because production uses a new `JWT_SECRET`. Nexconn user tokens are issued again during login. The export contains private account data and password hashes: never commit or share it, and keep an encrypted backup until migration is verified.
+Use the Neon **pooled** URL for a dedicated development branch first. Set that target explicitly in the shell as `TEST_DATABASE_URL` (do not use the production variable), then run:
 
-After a disk-backed Render service is deployed, configure SSH/SFTP and transfer the export to `/data/nexconn-live-migration.sqlite` with Render's documented `scp -s` flow. Change the service's private `DATABASE_PATH` setting to `/data/nexconn-live-migration.sqlite` and restart/redeploy; the app then opens the migrated DB. Render persistent disks and SSH access require a compatible paid service. Do not copy the live `.sqlite` file by itself while WAL writes are active; use this export script's SQLite backup API. Keep one service instance.
+```powershell
+npm run db:import-sqlite-to-postgres -- --source <private-snapshot.sqlite> --target-env TEST_DATABASE_URL
+```
+
+After verifying rows and existing-user login on the isolated target, schedule a maintenance window, take a final fresh snapshot from the confirmed production SQLite source, and import that snapshot once into an empty Neon production database. Existing users retain their IDs and password hashes and can sign in again; app sessions are intentionally not carried over. Keep the SQLite source and encrypted backup as immutable rollback evidence. Production import is a manual cutover step and was not run by this code change.
 
 ```mermaid
 erDiagram
@@ -247,9 +258,9 @@ erDiagram
   SESSIONS {
     text id PK
     text user_id FK
-    integer expires_at
-    integer revoked_at
-    integer created_at
+    bigint expires_at
+    bigint revoked_at
+    bigint created_at
   }
   FAVORITES {
     text user_id PK, FK
@@ -261,7 +272,7 @@ erDiagram
 
 ## Messaging, favorites, search and files
 
-The SDK owns Nexconn connection, real-time message send/receive, message history, timestamps, and supported read receipts. The displayed timestamp comes from the SDK's message `sentTime`. The UI uses SDK `SENT` and receipt-backed `READ` states; it does not fake a delivered status. Existing direct and group channels may be favorited. Favorites persist in SQLite per Nexconn Chat account; All lists supported channels once, and Favorites filters to saved channels. Search within a conversation covers messages the SDK has loaded, not an unbounded server-side index.
+The SDK owns Nexconn connection, real-time message send/receive, message history, timestamps, and supported read receipts. The displayed timestamp comes from the SDK's message `sentTime`. The UI uses SDK `SENT` and receipt-backed `READ` states; it does not fake a delivered status. Existing direct and group channels may be favorited. Favorites persist in PostgreSQL per Nexconn Chat account; All lists supported channels once, and Favorites filters to saved channels. Search within a conversation covers messages the SDK has loaded, not an unbounded server-side index.
 
 The app supports direct conversations, text, voice messages, images and files. Attachments are selected in the SDK composer, uploaded with Nexconn's file uploader, and stored by Nexconn. The SDK provides the recipient with its download flow; the app listens to the documented UI download event and calls `Message.downloadMedia()`. Images and PDF may preview when the browser and SDK response permit; other files use attachment download. Newly uploaded PDFs request inline disposition. Signed media links can expire; this SDK integration has no verified URL-refresh mechanism, so an expired link needs a renewed message/link from Nexconn. SDK constraints currently reject empty files and files above 100 MiB in the UI error path. Real upload, receiver download, expired-link and preview checks require two connected live Nexconn accounts.
 
@@ -273,63 +284,121 @@ The guarded `postinstall` patch is pinned specifically to `@nexconn/chatui@26.2.
 - Helmet configures CSP/security headers; scripts are same-origin, while inline styles remain allowed for SDK web-component rendering.
 - Express limits JSON request bodies to 32 KiB. API errors are sanitized. Browser diagnostics expose selected status codes/booleans only; production diagnostics are disabled. SDK log level is errors only.
 - `npm run audit:secrets` scans app source and production assets against configured sensitive environment values without printing those values.
-- The container runs as the unprivileged `node` user and uses a health check. `SIGTERM`/`SIGINT` closes the server and SQLite handle.
+- The container runs as the unprivileged `node` user and has a health check. `SIGTERM`/`SIGINT` closes the HTTP server and PostgreSQL pool.
 - Don't mount a public database directory, put credentials in image build args, or share production App Secret values in support tickets.
 - Review [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) and rotate credentials marked as potentially exposed before a public launch.
 
 ## Verification and known limits
 
-The test suite covers app registration/login, hash storage, duplicate accounts, two-user discovery, protected identity, expired/revoked sessions, CSRF origin checks, per-user favorites, and mocked Nexconn token signing. SDK patch tests inspect the installed 26.2.0 package. Tests do not connect to Nexconn or verify real attachment transfer. A local build cannot prove production Console settings, deployed secrets, live media access, or mobile browser behavior. No screenshots are included in this repository.
+The test suite covers PostgreSQL-backed registration/login, hash storage, duplicate accounts, two-user discovery, protected identity, expired/revoked sessions, CSRF origin checks, per-user favorites, migrations, transaction rollback, SQLite importer integrity and retry safety, and mocked Nexconn token signing. Database tests use isolated PGlite PostgreSQL instances and do not connect to Neon. SDK patch tests inspect the installed 26.2.0 package. Tests do not connect to Nexconn or verify real attachment transfer.
 
-Known operational limits: no app-level mirrored chat history; search is restricted to loaded SDK history; no explicit delivered tick; token validity is a Console setting; expired attachment URLs cannot be refreshed here; one SQLite-backed service instance; no versioned migrations; no lint/formatter tooling; no public deployment configured yet. The production build currently warns that the SDK Engine chunk is about 860 kB minified (about 179 kB gzip); the application keeps SDK loading on the authenticated chat path and does not suppress the build warning.
+Known operational limits: no app-level mirrored chat history; search is restricted to loaded SDK history; no explicit delivered tick; token validity is a Console setting; expired attachment URLs cannot be refreshed here; Neon Free may suspend compute and has usage limits; no lint/formatter tooling. The production build currently warns that the SDK Engine chunk is about 860 kB minified (about 179 kB gzip); the application keeps SDK loading on the authenticated chat path and does not suppress the build warning.
 
-## Production deployment with Render (Docker)
+## Production deployment: Vercel frontend, Render Free API, Neon Free PostgreSQL
 
-Render is a suitable Docker web-service target because this application needs a persistent Node process, one same-origin API/UI service, and durable writable storage for SQLite. Render web services support Docker, custom domains, environment variables and health checks; its filesystem is ephemeral unless a persistent disk is attached. A disk-backed SQLite service should run as one instance. Review the current [Render Docker guide](https://render.com/docs/docker), [web services guide](https://render.com/docs/web-services), [persistent disks guide](https://render.com/docs/disks), and [health checks guide](https://render.com/docs/health-checks) before provisioning; plan availability and cost according to Render's current plans.
+### Architecture
 
-### Deploy steps
+Vercel serves the static Vite frontend and preserves the existing /api/* rewrite to https://nexconn-chat.onrender.com. Render runs the Dockerized Express API. Neon stores users, password hashes, app sessions, and favorites through a pooled PostgreSQL DATABASE_URL. The app does not persist production state on Render temporary storage; no Render disk is needed. Nexconn continues to own message history and media.
 
-1. Create a GitHub repository and push this project (see GitHub setup below).
-2. In Render, select **New → Web Service**, connect the GitHub repository and choose the intended branch.
-3. Select **Docker** as the runtime. Keep the repository's `Dockerfile`; no build/start override is needed.
-4. Set health check path to `/api/health`. The container binds `0.0.0.0` using `PORT`.
-5. Add a persistent disk mounted at `/data`; initially use `DATABASE_PATH=/data/nexconn-chat.sqlite`. Disk-backed services have deployment availability trade-offs; review Render's current disk documentation.
-6. Add private environment values in the Render service settings: `NODE_ENV=production`, `APP_ORIGIN=https://<your-service>.onrender.com` (change after setting a custom domain), `JWT_SECRET` (random, at least 32 characters), `DATABASE_PATH=/data/nexconn-chat.sqlite`, `TRUST_PROXY_HOPS=1` only if one trusted proxy hop is confirmed, `NEXCONN_APP_KEY`, `NEXCONN_APP_SECRET`, `NEXCONN_API_BASE_URL`, and `NEXCONN_AREA_CODE`. Keep all credentials in secret settings, never in the repo or Docker build args.
-7. Transfer `data/nexconn-live-migration.sqlite` into `/data` through the secure migration steps above, change `DATABASE_PATH` to that file, and restart. Verify an existing account can sign in, then check health, register two test accounts, connect both SDK sessions, exchange a text message and attachment, refresh, log out/in, and confirm persistence. Verify App Secret and finite user-token validity in Nexconn Console before inviting real users.
-8. For a custom domain, add it in Render, configure the DNS records Render displays, wait for TLS issuance, then set `APP_ORIGIN` to that exact HTTPS origin and redeploy. `APP_ORIGIN` must not include a path or trailing route.
-9. Back up the SQLite volume on an operational schedule and test restore. Monitor Render deploy logs and health status; never include request bodies or tokens in logs.
+### Set up Neon
 
-This repository does not contain Render account access, a connected GitHub remote, production credentials approval, billing approval, or a domain. Therefore no live deployment or public URL is claimed.
+1. Create a Neon Free project in a region reasonably close to the Render service. Use a dedicated development branch/database separate from production.
+2. In Neon connection details, enable the pooled connection option. Store the resulting PostgreSQL URL with SSL required as DATABASE_URL. Keep it server-side; never put it in Vite variables, frontend source, or browser storage.
+3. The service applies versioned schema migrations on startup. Do not manually create duplicate app tables. Take a Neon backup/branch before production data import.
 
+Neon Free has usage/storage limits and can suspend its compute when idle. The first request after idle may have extra latency. Check Neon's current dashboard limits before launch; the free plan is not an always-on SLA.
+
+### Configure Render Free
+
+1. Open the existing nexconn-chat Render web service. Select the repository Dockerfile runtime, Docker context/repository root, and health check path /api/health.
+2. Keep the service on the Free instance plan. Do not add a disk. Render injects PORT.
+3. Set these variables under the service Environment settings. Enter secrets directly in Render; do not paste their values into source or chat.
+
+   | Key | Value |
+   | --- | --- |
+   | NODE_ENV | production |
+   | APP_ORIGIN | https://nexconn-chat.vercel.app |
+   | DATABASE_URL | Neon pooled PostgreSQL URL with SSL required |
+   | JWT_SECRET | Private random value, at least 32 characters |
+   | NEXCONN_APP_KEY | Existing Nexconn App Key |
+   | NEXCONN_APP_SECRET | Existing Nexconn App Secret, server-side only |
+   | NEXCONN_API_BASE_URL | Existing HTTPS Nexconn regional API origin |
+   | NEXCONN_AREA_CODE | Matching region code |
+   | TRUST_PROXY_HOPS | Keep 0 unless Render's trusted proxy hop count has been verified |
+
+4. Deploy only after the production SQLite source and migration snapshot are verified. Confirm logs contain the generic startup message and no credential or connection string. Render Free services may spin down when idle; this is separate from Neon compute suspension.
+
+### Configure Vercel
+
+Keep the Vite preset, repository root, build command npm run build, and output directory dist. Preserve vercel.json's /api/:path* rewrite to Render. Do not set DATABASE_URL or a database/API secret in Vercel. After deployment, Vercel health requests should be proxied to Render and return the API health response.
+
+### Verify the authoritative SQLite source before cutover
+
+Do not assume data/nas-on.sqlite, data/nexconn-live-migration.sqlite, or any other local file is the production source. Before migration:
+
+1. In the Render Dashboard, inspect the currently deployed service, its deployed commit, and the environment variable name DATABASE_PATH (do not copy secrets). Check the service storage configuration and the running version startup logs to establish which database path it opened.
+2. If a persistent volume is attached, verify its mount path and identify the SQLite file under that mount. If no volume exists, determine whether the current file is on ephemeral service storage and whether the service has restarted since its last known write. Do not proceed if the data authority or completeness is uncertain.
+3. Schedule a maintenance window and stop account/favorite writes. Use the currently running service authorized Shell or an approved secure file-transfer method to create a SQLite online backup from that exact file. Never copy only the live SQLite file while WAL writes are active.
+4. Run read-only checks on the backup: PRAGMA integrity_check must return ok; PRAGMA foreign_key_check must return no rows; record users/favorites counts and confirm representative IDs/timestamps without printing password hashes. Keep the original untouched and store an encrypted backup outside the service.
+5. Make the verified snapshot available to the migration command in a private path. If Render Free does not provide a secure Shell/transfer route for the file, stop and choose an approved private transfer method; do not expose a temporary public download endpoint.
+
+Prepare a migration copy from a verified SQLite file by running:
+
+    npm run db:prepare-migration -- --source <verified-production-copy.sqlite> --snapshot <private-snapshot.sqlite>
+
+### Test and cut over
+
+First test on an isolated Neon development branch. Set its pooled URL as TEST_DATABASE_URL; never use the production URL for this rehearsal:
+
+    npm run db:import-sqlite-to-postgres -- --source <private-snapshot.sqlite> --target-env TEST_DATABASE_URL
+
+The importer requires explicit source and target selection, refuses a non-empty app database, snapshots SQLite consistently, keeps the source unchanged, imports users/favorites transactionally, excludes sessions, and verifies every imported field, counts, uniqueness, and relationships. Password hashes are passed only as database parameters and are never logged. Re-running against a populated target is rejected without changing its rows.
+
+For production cutover, perform a second fresh snapshot after writes are paused, back up the Neon target, and import exactly once into the empty production database using the same command with --target-env DATABASE_URL. Then deploy the PostgreSQL runtime and verify:
+
+1. https://nexconn-chat.onrender.com/api/health returns HTTP 200 and {"ok":true}.
+2. https://nexconn-chat.vercel.app/api/health returns the same response through the existing rewrite.
+3. An existing user can sign in with the old password; verify the account ID and favorites are preserved. Sessions are intentionally not imported, so all users sign in again.
+4. Register/login/logout, profiles, user search, favorites, Nexconn connection, and two-account real-time messaging work.
+5. Redeploy/restart the Render service and confirm account/favorite data remains in Neon. Also test after Neon has idled so cold-start behavior is understood.
+
+Do not cut over while writes are active between the final snapshot and the new app accepting traffic. The current source and backup should remain read-only and retained after launch.
+
+### Rollback and cost limits
+
+For application rollback after cutover, redeploy a PostgreSQL-compatible application version and restore Neon from the verified backup/branch if necessary. Keep the SQLite source as a separate encrypted archive. Do not switch the Free Render service back to SQLite on its ephemeral filesystem; it cannot provide durable SQLite persistence without a persistent disk. Any recovery of writes made after the snapshot must be planned explicitly.
+
+This plan uses Render Free without a disk and Neon Free. It has no paid Render persistence requirement, but Free services/databases have usage limits, idle suspension, possible cold starts, and no production availability guarantee. Verify current plan terms and capacity in each dashboard before inviting users. No production data has been imported, and no service environment variable or deployment has been changed by this code work.
 ## GitHub setup and maintenance
 
-The workspace repository currently has branch `master`, no commits, and no remote. After creating/choosing the intended GitHub repository, configure its exact remote and verify it before the first push:
+The Git repository is connected to `origin` on branch `main`. Changes in this workspace are not automatically deployed or pushed. Before a release, review the exact diff, stage only intended files, and verify the configured remote/branch:
 
 ```powershell
-git remote add origin https://github.com/<owner>/<repository>.git
 git remote -v
+git branch --show-current
 git status --short
 ```
 
-Review and stage only intended files, inspect `git diff --cached`, run tests/build/security checks, then commit and push the chosen branch. Do not add `.env`, `data/`, `node_modules/`, or `dist/`. No remote or history exists yet, so this README does not prescribe a force push or history rewrite. Once a remote exists, maintain protected mainline branches, review dependency updates, run checks before releases, and keep credentials only in the host's secret manager.
+Do not add `.env`, `data/`, `node_modules/`, or `dist/`. Keep deployment credentials only in the host's secret manager. These code changes have not been committed, pushed, or deployed.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
 | App rejects register/login with Origin error | Make `APP_ORIGIN` match the browser origin exactly, including scheme and port. |
-| Production server exits immediately | Set valid HTTPS `APP_ORIGIN`, HTTPS Nexconn API URL, `JWT_SECRET`, both Nexconn server credentials, absolute persistent `DATABASE_PATH`, and valid `PORT`. |
+| Production server exits immediately | Set a valid server-side Neon PostgreSQL `DATABASE_URL`, exact HTTPS `APP_ORIGIN`, HTTPS Nexconn API URL, `JWT_SECRET`, and both Nexconn server credentials. |
 | Rate limit seems shared by every user in production | Check the real reverse-proxy topology and set `TRUST_PROXY_HOPS` to the verified hop count; do not trust arbitrary forwarded headers. |
 | User sees “messaging not configured” | Check App Key/Secret privately in server environment and ensure API base URL and area code are the same region. Never paste the secret into browser variables. |
 | Account opens but no channels appear | Confirm SDK identity matches the app account, check the Nexconn Console's user/channel permissions, and inspect sanitized development events. |
 | Second login in the same page fails | The SDK UI is a page-lifetime singleton; use the existing `prepareNexconn`/disconnect flow and do not destroy/reinitialize it manually. |
 | File sends but will not open | Check SDK upload result and receiver permission, URL freshness, browser-supported preview format and SDK media-link response. Resend if the remote URL expired. |
-| Database resets after deploy | Ensure the SQLite path is under the mounted persistent disk and retain one app instance. |
+| Database connection fails after deploy | Check the Render-only `DATABASE_URL`, use Neon's pooled connection string with SSL required, and verify the Neon project/branch is active and within plan limits. Never paste the URL into logs or tickets. |
 | Vite cannot reach the API | Confirm Express port equals `PORT` and Vite's `/api` proxy target in `vite.config.ts`. |
+| Vercel returns `404 NOT_FOUND` for `/api/...` | Deploy `vercel.json` and confirm its external rewrite points to the current Render service URL. |
 
 ## Contributions and future improvements
 
-Before changing SDK behavior, inspect the exact pinned package types and documentation, then update the guarded patch and its tests together. Do not log tokens, auth payloads or message bodies. Suggested next steps are live two-account attachment and mobile-browser verification, a versioned migration framework, shared database before multi-instance scaling, and explicit CI lint/format policies after choosing project tooling.
+Before changing SDK behavior, inspect the exact pinned package types and documentation, then update the guarded patch and its tests together. Do not log tokens, auth payloads or message bodies. Suggested next steps are authoritative production SQLite verification and staged Neon rehearsal, then live two-account attachment and mobile-browser verification.
 
 ## SDK licenses
 
