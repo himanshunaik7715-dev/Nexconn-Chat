@@ -1,6 +1,7 @@
 FROM node:22-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json .npmrc ./
+COPY scripts/patch-nexconn-chatui.js scripts/nexconn-calendar-date.js ./scripts/
 RUN npm ci
 COPY . .
 RUN npm run build
